@@ -1,9 +1,17 @@
 #!/usr/bin/env python
+import rospy
+
 import numpy as np
 import scipy as sp
 import sympy as sy
 
 from sympy import symbols, diff,lambdify
+from math import sin, cos
+
+from nav_msgs.msg import Odometry
+from snowmower_msgs.msg import DecaWaveMsg
+from sensor_msgs.msg import Imu
+from px_comm.msg import OpticalFlow
 
 symbol_names = [
     'x', #x position map frame
@@ -126,7 +134,6 @@ def motion_update(last_state, imu_reading, delta_ms):
     cov = last_state['covariance']
     width = len(pose)+len(imu_reading)+1
     everything = np.zeros((width,1))
-    print(pose.shape)
     everything[:len(pose),:] = pose
     everything[len(pose):-1,:] = imu_reading
     everything[-1,:] = delta_ms
@@ -134,8 +141,6 @@ def motion_update(last_state, imu_reading, delta_ms):
     V_t1 = model_control_Jacobian(everything)
     M_t1 = model_control_covariance(imu_reading)
     mu_bar = np.matrix(motion_model(everything))
-    print('mu_bar')
-    print(mu_bar.shape)
     si_bar = G_t1*cov*G_t1.T+V_t1*M_t1*V_t1.T
     new_state = {
     'pose': mu_bar,
@@ -159,12 +164,44 @@ def uwb_update(last_state,uwb_reading, delta_ms):
     (7,15),
     ]
 
-    for index,distance in uwb_reading:
+    for index,distance in enumerate(uwb_reading):
         x,y = locations[index]
         last_state = individual_uwb_update(last_state,x,y,distance)
 
     return last_state
 
+state = None
+import datetime
+last_time = datetime.datetime.now()
+last_imu = None
+
+def ros_imu_update(imu_msg):
+    global last_imu
+    last_imu = imu_msg
+    current_time = datetime.datetime.now()
+    delta_sec = (current_time - last_time).total_seconds()
+    global state
+    state = motion_update(state, imu_msg, delta_sec)
+    global last_time
+    last_time = current_time
+
+def ros_uwb_update(uwb_msg):
+    current_time = datetime.datetime.now()
+    delta_sec = (current_time - last_time).total_seconds()
+    global state
+    state = motion_update(state, last_imu, delta_sec)
+    state = uwb_update(state, uwb_msg, 0.0)
+    global last_time
+    last_time = current_time
+
+def ros_vo_update(vo_msg):
+    current_time = datetime.datetime.now()
+    delta_sec = (current_time - last_time).total_seconds()
+    global state
+    state = motion_update(state, last_imu, delta_sec)
+    state = vo_update(state, vo_msg, 0.0)
+    global last_time
+    last_time = current_time
 
 
 if __name__ == '__main__':
@@ -188,6 +225,8 @@ if __name__ == '__main__':
 }
     magic_args = [init_state['pose'][symbol_name] for symbol_name in symbol_names[:-5]]
     init_state['pose'] = np.matrix([magic_args]).reshape((12,1))
+    global state
+    state = init_state
     imu_reading = {
     'ith':0, #imu sensor reading position
     'iwz':0, #imu sensor reading rotation 
@@ -202,7 +241,37 @@ if __name__ == '__main__':
     ]
     imu_reading = np.matrix(imu_reading).reshape((4,1))
     print('hello asshats')
+    # equivalent to an imu motion update
     new_state = motion_update(init_state,imu_reading,100) 
     print('hello dumbasses')
+    # equivalent to a sensor update
     new_state = motion_update(new_state,imu_reading,100) 
+    new_state = uwb_update(new_state, [1,2,3,4],100)
 
+    rospy.init_node('joker_magic_also_does_EKF')
+    odom_pub = rospy.Publisher('/odom', Odometry, queue_size=1)
+    rospy.Subscriber('/dw/t0/data', DecaWaveMsg, ros_uwb_update)
+    rospy.Subscriber('/imu/data', Imu, ros_imu_update)
+    rospy.Subscriber('/px4flow/opt_flow', OpticalFlow, ros_vo_update)
+    rate = rospy.Rate(50)
+    
+    def convert_state_to_odom_msg(state):
+        # TODO this will not work
+        print(state)
+        odom = Odometry()
+        odom.pose.pose.position.x = state['pose'][0]
+        odom.pose.pose.position.y = state['pose'][1]
+        odom.pose.pose.position.z = 0
+        odom.pose.pose.orientation.x = cos(state['pose'][2]/2)
+        odom.pose.pose.orientation.y = 0
+        odom.pose.pose.orientation.z = 0
+        odom.pose.pose.orientation.w = sin(state['pose'][2]/2)
+
+
+        return odom
+
+    while not rospy.is_shutdown():
+        odom_pub.publish(convert_state_to_odom_msg(state))
+        rate.sleep()
+
+    print('exiting')
